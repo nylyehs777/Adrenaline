@@ -1,4 +1,4 @@
-#include <string.h>
+// mic test #include <string.h>
 
 #include <pspusbcam.h>
 #include <psploadcore.h>
