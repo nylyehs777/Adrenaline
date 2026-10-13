@@ -189,7 +189,7 @@ int sceUsbCamSetupMicEx_Patched(PspUsbCamSetupMicExParam *exparam, void *workare
 
 	pspSdkSetK1(k1);
 
-	g_mute_mic = 1;
+	g_mute_mic = 0;
 
 	return res;
 }
