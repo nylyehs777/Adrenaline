@@ -14,6 +14,13 @@ static void* g_mic_buf = NULL;
 static SceSize g_mic_size = 0;
 static int g_dummy_read_cam = 0;
 
+// Mic timing fix for the XMB camera app:
+// each stock mic read returns one grain of 176 samples (11025 Hz),
+// but the app only reads once per video frame, so half the audio is lost.
+#define MIC_GRAIN 176
+#define MIC_SECOND_OFFSET 384
+static int g_mic_fix = 0;
+
 ////////////////////////////////////////////////////////////////////////////////
 // PATCHED IMPLEMENTATIONS
 ////////////////////////////////////////////////////////////////////////////////
@@ -68,7 +75,6 @@ static int sceUsbCamSetupStillEx_Patched(PspUsbCamSetupStillExParam *exparam) {
 			//param.resolution = 6;
 		break;
 	}
-
 	param.jpegsize = exparam->jpegsize;
 	param.complevel = exparam->complevel;
 	param.delay = exparam->delay;
@@ -119,10 +125,9 @@ int sceUsbCamSetupVideoEx_Patched(PspUsbCamSetupVideoExParam *exparam, void *wor
 		case 8:
 			// Vita camera doesn't support 1280x960
 			param.resolution = 7;
-//			param.resolution = 6;
+			// param.resolution = 6;
 		break;
 	}
-
 	param.framerate = exparam->framerate;
 	param.wb = exparam->wb;
 	param.saturation = exparam->saturation;
@@ -154,23 +159,57 @@ static int (* _sceUsbCamWaitReadMicEnd)(void);
 int sceUsbCamWaitReadMicEnd_Patched() {
 	int k1 = pspSdkSetK1(0);
 	int res = _sceUsbCamWaitReadMicEnd();
+
 	if (g_mute_mic && g_mic_buf) {
 		memset(g_mic_buf, 0, g_mic_size);
 	}
+
+	if (g_mic_fix && g_mic_buf && g_mic_size >= 1024 && g_mic_size <= 2048) {
+		short *out = (short *)g_mic_buf;
+		int n_out = g_mic_size / 2;
+		char *second = (char *)g_mic_buf + MIC_SECOND_OFFSET;
+
+		// ask the stock driver for one more grain, placed behind the first
+		int r = _sceUsbCamReadMic(second, g_mic_size - MIC_SECOND_OFFSET);
+		if (r >= 0) {
+			_sceUsbCamWaitReadMicEnd();
+
+			short raw[2 * MIC_GRAIN];
+			memcpy(raw, out, MIC_GRAIN * 2);
+			memcpy(raw + MIC_GRAIN, second, MIC_GRAIN * 2);
+
+			// stretch the 2 grains (352 samples) over the whole buffer
+			// with linear interpolation (11025 Hz -> the app's 22050 Hz)
+			int n_in = 2 * MIC_GRAIN;
+			for (int i = 0; i < n_out; i++) {
+				int pos = (i * (n_in - 1) * 256) / (n_out - 1);
+				int idx = pos >> 8;
+				int frac = pos & 255;
+				int s1 = raw[idx];
+				int s2 = (idx + 1 < n_in) ? raw[idx + 1] : s1;
+				out[i] = (short)(s1 + (((s2 - s1) * frac) >> 8));
+			}
+		}
+	}
+
 	pspSdkSetK1(k1);
 	return res;
 }
 
-
 static int (* _sceUsbCamSetupMic)(void *param, void *workarea, int wasize);
 int sceUsbCamSetupMic_Patched(void *param, void *workarea, int wasize) {
 	int res = 0;
-	int k1 = pspSdkSetK1(0);
-	res = _sceUsbCamSetupMic(param, workarea, wasize);
-	pspSdkSetK1(k1);
-	g_mute_mic = 0;
-	return res;
 
+	int k1 = pspSdkSetK1(0);
+
+	res = _sceUsbCamSetupMic(param, workarea, wasize);
+
+	pspSdkSetK1(k1);
+
+	g_mute_mic = 0;
+	g_mic_fix = 0;
+
+	return res;
 }
 
 int sceUsbCamSetupMicEx_Patched(PspUsbCamSetupMicExParam *exparam, void *workarea, int wasize) {
@@ -178,7 +217,9 @@ int sceUsbCamSetupMicEx_Patched(PspUsbCamSetupMicExParam *exparam, void *workare
 
 	// TODO: xmb wants 22050, but it causes crash for some reason
 	// TODO: pspemu resampler looks broken (see invizimals voice chat, for example)
+
 	int k1 = pspSdkSetK1(0);
+
 	PspUsbCamSetupMicParam param = {0};
 	param.size = sizeof(PspUsbCamSetupMicParam);
 	param.alc = exparam->alc;
@@ -190,6 +231,7 @@ int sceUsbCamSetupMicEx_Patched(PspUsbCamSetupMicExParam *exparam, void *workare
 	pspSdkSetK1(k1);
 
 	g_mute_mic = 0;
+	g_mic_fix = 1;
 
 	return res;
 }
@@ -197,14 +239,18 @@ int sceUsbCamSetupMicEx_Patched(PspUsbCamSetupMicExParam *exparam, void *workare
 static int (* _sceUsbCamSetEvLevel)(int level);
 int sceUsbCamSetEvLevel_Patched(int level) {
 	int res = 0;
+
 	int k1 = pspSdkSetK1(0);
+
 	g_dummy_read_cam = 1;
 	sceKernelDelayThread(100000);
 	res = _sceUsbCamSetEvLevel(level);
 	sceKernelDelayThread(100000);
 	g_dummy_read_cam = 0;
 	sceKernelDelayThread(100000);
+
 	pspSdkSetK1(k1);
+
 	return res;
 }
 
@@ -217,21 +263,28 @@ int sceUsbCamReadVideoFrame_Patched(u8 *buf, SceSize size) {
 		pspSdkSetK1(k1);
 		return 0;
 	}
+
 	int res = _sceUsbCamReadVideoFrame(buf, size);
+
 	pspSdkSetK1(k1);
+
 	return res;
 }
 
 static int (* _sceUsbCamWaitReadVideoFrameEnd)(void);
 int sceUsbCamWaitReadVideoFrameEnd_Patched() {
 	int k1 = pspSdkSetK1(0);
+
 	if (g_dummy_read_cam) {
 		sceKernelDelayThread(300000);
 		pspSdkSetK1(k1);
 		return 0x8000;
 	}
+
 	int res = _sceUsbCamWaitReadVideoFrameEnd();
+
 	pspSdkSetK1(k1);
+
 	return res;
 }
 
@@ -243,12 +296,15 @@ void PatchUSBCamDriver(SceModule* mod) {
 	REDIRECT_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x0A41A298), sceUsbCamSetupStillEx_Patched);
 	REDIRECT_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0xCFE9E999), sceUsbCamSetupVideoEx_Patched);
 	REDIRECT_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x2E930264), sceUsbCamSetupMicEx_Patched);
+
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0xFB0A6C5D), sceUsbCamStillInput_Patched, _sceUsbCamStillInput);
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x1D686870), sceUsbCamSetEvLevel_Patched, _sceUsbCamSetEvLevel);
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x99D86281), sceUsbCamReadVideoFrame_Patched, _sceUsbCamReadVideoFrame);
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0xF90B2293), sceUsbCamWaitReadVideoFrameEnd_Patched, _sceUsbCamWaitReadVideoFrameEnd);
+
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x3DC0088E), sceUsbCamReadMic_Patched, _sceUsbCamReadMic);
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0x03ED7A82), sceUsbCamSetupMic_Patched, _sceUsbCamSetupMic);
 	HIJACK_FUNCTION(sctrlHENFindFunctionInMod(mod, "sceUsbCam", 0xB048A67D), sceUsbCamWaitReadMicEnd_Patched, _sceUsbCamWaitReadMicEnd);
+
 	sctrlFlushCache();
 }
