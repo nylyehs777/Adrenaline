@@ -1,4 +1,4 @@
-6.61 Adrenaline
+ 6.61 Adrenaline
 ================================================================================
 
 A software that transforms your PS Vita into a two-in-one device
